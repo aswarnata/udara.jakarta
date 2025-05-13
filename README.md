@@ -5,7 +5,7 @@
 This project consists of two integrated components that work together to collect, process, and analyze PM2.5 air quality data across Jakarta at the kelurahan level:
 
 1. **Data Collection**: An automated scraper that collects high-frequency PM2.5 data from Jakarta's official air quality monitoring network
-2. **Spatial Analysis**: An interpolation system that transforms point-based sensor measurements into comprehensive pollution estimates for all 267 kelurahan in Jakarta
+2. **Spatial Analysis**: An interpolation system that transforms point-based sensor measurements into comprehensive pollution estimates for all Kelurahan in Jakarta (this version only sucesfully recovers 260 Kelurahan)
 
 Together, these components create a complete workflow from raw data acquisition to detailed spatial analysis, enabling a comprehensive understanding of air pollution patterns across Jakarta.
 
