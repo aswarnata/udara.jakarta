@@ -243,8 +243,5 @@ Future development could include:
 
 ## Credits and Contact
 
-This project was developed to support environmental monitoring and public health research in Jakarta. For questions or collaboration opportunities, please contact [Your Contact Information].
+This project was developed to support indoor air quality research in Jakarta. For questions or collaboration opportunities, please contact iaryaswarnata@worldbank.org.
 
-## License
-
-[Add appropriate license information here]
