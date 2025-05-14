@@ -194,7 +194,6 @@ The output CSV files from the Data Collection System serve as input for the Inte
 
 1. The scraper emails CSV files with a consistent naming pattern that includes the date
 2. These files can be collected and organized for batch processing by the R analysis script
-3. The R script is designed to load and process multiple CSV files spanning different dates
 
 ## Setting Up the Complete System
 
