@@ -1,20 +1,18 @@
 #===============================================================================
-# PARALLEL PROCESSING SETUP
+# KEY PARAMETERS - Set at the beginning for easy modification
 #===============================================================================
-# Step 9: Process all timestamps with parallelization
-cat("\nBeginning IDW interpolation for all timestamps using parallel processing...\n")
+# Primary parameter - optimized nmax value from sensitivity analysis
+nmax_points_to_use <- 3  # Number of nearest sensors to use for IDW interpolation
 
-# Using reduced nmax for better performance
-min_sensors_to_use <- 50  # 50 sensors must active trhoughout Jakarta at given time for the calculation to proceed
-nmax_points_to_use <- 10  # Each grid is contributed by maximum 10 nearest sensors
+# Secondary parameters
+min_sensors_to_use <- 50  # Minimum active sensors required per timestamp
+idp_power <- 2            # IDW power parameter
 
-cat("Using parameters: min_sensors =", min_sensors_to_use, ", nmax =", nmax_points_to_use,
-    "(nearest points), idp_power =", 2, "\n")
 #===============================================================================
 # PACKAGE MANAGEMENT - Install required packages if not already installed
 #===============================================================================
 # List of required packages
-required_packages <- c("sf", "gstat", "dplyr", "lubridate", "tidyr", "haven", 
+required_packages <- c("sf", "gstat", "dplyr", "lubridate", "tidyr", "haven",
                        "stringr", "geosphere", "parallel", "foreach", "doParallel")
 
 # Check which packages are not installed
@@ -52,8 +50,7 @@ dirs <- list(
   log = file.path(base_dir, "log"),
   processed = file.path(base_dir, "processed"),
   output = file.path(base_dir, "output"),
-  shp = file.path(base_dir, "shp")
-)
+  shp = file.path(base_dir, "shp"))
 
 # Create directories if they don't exist
 for (dir in dirs) {
@@ -66,10 +63,14 @@ for (dir in dirs) {
 #===============================================================================
 # SET UP LOGGING
 #===============================================================================
-log_file <- file.path(dirs$log, paste0("pm25_interpolation_log_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".txt"))
-
+log_file <- file.path(dirs$log, paste0("pm25_interpolation_final_nmax", nmax_points_to_use, "_", 
+                                       format(Sys.time(), "%Y%m%d_%H%M%S"), ".txt"))
 # Start logging
 sink(log_file, append = FALSE, split = TRUE)  # 'split = TRUE' sends output to both console and file
+
+cat("\n=== JAKARTA PM2.5 INTERPOLATION (FINAL VERSION) ===\n")
+cat("Using nmax =", nmax_points_to_use, "and minimum", min_sensors_to_use, "active sensors\n")
+cat("Started at:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
 
 #===============================================================================
 # DATA LOADING
@@ -107,7 +108,7 @@ sensors <- sensors %>%
 
 # Flag invalid coordinates using updated bounds to include Kepulauan Seribu
 invalid_coords <- sensors %>%
-  filter(is.na(longitude) | is.na(latitude) |
+  filter(is.na(longitude) | is.na(latitude) | 
            longitude < 106 | longitude > 107 |     # Longitude bounds remain the same
            latitude < -7 | latitude > -5.4)        # Extended upper bound to include islands north of Jakarta
 
@@ -156,7 +157,7 @@ sensor_frequency <- sensors %>%
     half_hour_readings = sum(is_half_hour),
     half_hour_valid = sum(is_half_hour & !is.na(pm25)),
     full_hour_valid = sum(!is_half_hour & !is.na(pm25)),
-    half_hour_valid_ratio = ifelse(half_hour_readings > 0, 
+    half_hour_valid_ratio = ifelse(half_hour_readings > 0,
                                    half_hour_valid / half_hour_readings,
                                    0),
     is_30min = half_hour_valid_ratio > 0.7,  # If >70% of half-hour timestamps have data
@@ -209,46 +210,67 @@ if(use_30min_intervals) {
 }
 
 #===============================================================================
-# INTERPOLATION HELPER FUNCTION
+# UPDATED IMPUTATION FOR HALF-HOUR ONLY
 #===============================================================================
-# Define helper function for interpolation
-interpolate_sensor <- function(df) {
+# Define helper function for imputation with updated rules
+impute_half_hour_only <- function(df) {
+  # Skip sensors with fewer than 3 total readings
+  if(nrow(df) < 3) {
+    return(df)
+  }
+  
   # Sort by time
   df <- df %>% arrange(rounded_datetime)
   
-  # For columns that need to be filled
-  for(col in c("longitude", "latitude", "pm25")) {
-    if(all(is.na(df[[col]]))) next  # Skip if all values are NA
+  # Extract hour and minute components
+  df$hour <- hour(df$rounded_datetime)
+  df$minute <- minute(df$rounded_datetime)
+  
+  # Process each half-hour mark (XX:30)
+  for(i in 2:nrow(df)) {
+    # Only process rows where:
+    # 1. Current row is at XX:30 (half-hour mark)
+    # 2. Current row has missing PM2.5
+    # 3. We have valid readings at both adjacent hour marks
     
-    # Try linear interpolation first (works for numeric values)
-    if(col == "pm25") {
-      df[[col]] <- approx(
-        x = as.numeric(df$rounded_datetime[!is.na(df[[col]])]), 
-        y = df[[col]][!is.na(df[[col]])],
-        xout = as.numeric(df$rounded_datetime),
-        method = "linear",
-        rule = 2  # Rule 2 uses nearest value extrapolation for ends
-      )$y
-    } else {
-      # For coordinates, just fill forward/backward as they shouldn't change
-      # Find nearest non-NA value
-      na_indices <- which(is.na(df[[col]]))
-      if(length(na_indices) > 0) {
-        for(i in na_indices) {
-          nearest_idx <- which(!is.na(df[[col]]))
-          if(length(nearest_idx) > 0) {
-            nearest <- nearest_idx[which.min(abs(nearest_idx - i))]
-            df[[col]][i] <- df[[col]][nearest]
-          }
+    # Check if current row is at half-hour mark and has missing PM2.5
+    if(df$minute[i] == 30 && is.na(df$pm25[i])) {
+      
+      # Look for previous full hour reading (XX:00)
+      prev_idx <- NULL
+      for(j in (i-1):1) {
+        if(df$minute[j] == 0 && df$hour[j] == df$hour[i] && !is.na(df$pm25[j])) {
+          prev_idx <- j
+          break
         }
+      }
+      
+      # Look for next full hour reading ((XX+1):00)
+      next_idx <- NULL
+      for(j in (i+1):nrow(df)) {
+        if(df$minute[j] == 0 && df$hour[j] == df$hour[i] + 1 && !is.na(df$pm25[j])) {
+          next_idx <- j
+          break
+        }
+      }
+      
+      # If we have both adjacent hour readings, perform imputation
+      if(!is.null(prev_idx) && !is.null(next_idx)) {
+        # Use simple linear interpolation (average of adjacent readings)
+        df$pm25[i] <- (df$pm25[prev_idx] + df$pm25[next_idx]) / 2
       }
     }
   }
+  
+  # Remove the temporary hour and minute columns
+  df$hour <- NULL
+  df$minute <- NULL
+  
   return(df)
 }
 
 #===============================================================================
-# HANDLE MIXED FREQUENCY DATA
+# HANDLE MIXED FREQUENCY DATA WITH UPDATED IMPUTATION
 #===============================================================================
 # Step 6: For sensors with hourly data or mixed patterns when using 30-min intervals, handle the missing half-hour data
 if(use_30min_intervals) {
@@ -297,12 +319,12 @@ if(use_30min_intervals) {
       rounded_datetime = all_timestamps
     )
     
-    # Join with existing data and forward/backward fill missing values
+    # Join with existing data
     sensor_filled <- sensor_full %>%
       left_join(sensor_data, by = c("sensor_id", "rounded_datetime"))
     
-    # Apply interpolation
-    sensor_filled <- interpolate_sensor(sensor_filled)
+    # Apply our half-hour only imputation function
+    sensor_filled <- impute_half_hour_only(sensor_filled)
     
     # Add to our collection
     interpolated_readings <- bind_rows(interpolated_readings, sensor_filled)
@@ -383,11 +405,19 @@ processed_summary <- processed_availability %>%
     min_coverage = min(coverage_percent),
     max_coverage = max(coverage_percent),
     avg_coverage = mean(coverage_percent),
-    timestamps_below_50pct = sum(coverage_percent < 50)
+    timestamps_below_50pct = sum(coverage_percent < 50),
+    timestamps_with_min_sensors = sum(available_sensors >= min_sensors_to_use),
+    total_timestamps = n()
   )
 
 cat("\nData availability after processing:\n")
 print(processed_summary)
+
+cat("\nFound", processed_summary$timestamps_with_min_sensors, "out of", processed_summary$total_timestamps, 
+    "timestamps with at least", min_sensors_to_use, "active sensors\n")
+cat("This represents", 
+    round(100 * processed_summary$timestamps_with_min_sensors / processed_summary$total_timestamps, 1), 
+    "% of all timestamps\n")
 
 #===============================================================================
 # LOAD GEOGRAPHICAL BOUNDARIES
@@ -456,11 +486,61 @@ kelurahan <- st_transform(kelurahan, st_crs(sensor_points))
 
 # Create interpolation grid with larger cell size for better performance
 cat("\nCreating interpolation grid...\n")
-# Increase grid cell size from 0.001 to 0.005 for better performance
+# Use 0.005 for better performance
 interpolation_grid <- st_make_grid(kelurahan, cellsize = 0.005, what = "centers") %>% 
   st_as_sf() %>%
   st_filter(kelurahan)
+
 cat("Created interpolation grid with", nrow(interpolation_grid), "points\n")
+
+#===============================================================================
+# SELECT TIMESTAMPS WITH MINIMUM SENSORS
+#===============================================================================
+# Filter timestamps that meet the minimum sensor threshold
+timestamps_with_enough_sensors <- processed_availability %>%
+  filter(available_sensors >= min_sensors_to_use)
+
+cat("\nIdentifying timestamps with at least", min_sensors_to_use, "active sensors...\n")
+cat("Found", nrow(timestamps_with_enough_sensors), "qualifying timestamps out of", 
+    nrow(processed_availability), "total timestamps\n")
+
+# Get list of qualifying timestamps
+qualifying_timestamps <- timestamps_with_enough_sensors$rounded_datetime
+
+#===============================================================================
+# IDENTIFY REPRESENTATIVE TIMESTAMPS FOR DISTANCE CALCULATION
+#===============================================================================
+# Find timestamps with max, min, and median sensor count
+min_sensor_timestamp <- timestamps_with_enough_sensors %>%
+  arrange(available_sensors) %>%
+  slice(1) %>%
+  pull(rounded_datetime)
+
+max_sensor_timestamp <- timestamps_with_enough_sensors %>%
+  arrange(desc(available_sensors)) %>%
+  slice(1) %>%
+  pull(rounded_datetime)
+
+# For median, get the middle value
+median_index <- ceiling(nrow(timestamps_with_enough_sensors) / 2)
+median_sensor_timestamp <- timestamps_with_enough_sensors %>%
+  arrange(available_sensors) %>%
+  slice(median_index) %>%
+  pull(rounded_datetime)
+
+# Store these timestamps in a list for easy checking
+representative_timestamps <- c(max_sensor_timestamp, min_sensor_timestamp, median_sensor_timestamp)
+
+cat("\nSelected representative timestamps for distance calculations:\n")
+cat("- Maximum sensors (", 
+    timestamps_with_enough_sensors$available_sensors[timestamps_with_enough_sensors$rounded_datetime == max_sensor_timestamp],
+    " sensors): ", format(max_sensor_timestamp, "%Y-%m-%d %H:%M:%S"), "\n", sep="")
+cat("- Minimum sensors (", 
+    timestamps_with_enough_sensors$available_sensors[timestamps_with_enough_sensors$rounded_datetime == min_sensor_timestamp],
+    " sensors): ", format(min_sensor_timestamp, "%Y-%m-%d %H:%M:%S"), "\n", sep="")
+cat("- Median sensors (", 
+    timestamps_with_enough_sensors$available_sensors[timestamps_with_enough_sensors$rounded_datetime == median_sensor_timestamp],
+    " sensors): ", format(median_sensor_timestamp, "%Y-%m-%d %H:%M:%S"), "\n", sep="")
 
 #===============================================================================
 # IDW INTERPOLATION FUNCTION
@@ -468,7 +548,7 @@ cat("Created interpolation grid with", nrow(interpolation_grid), "points\n")
 # Function to perform IDW for a single time period with tracking of contributing sensors and distances
 perform_idw_for_timepoint <- function(data, time_value, kelurahan_boundaries, grid,
                                       kelurahan_name_field = "NAMOBJ",
-                                      min_sensors = 3, nmax_points = 15,
+                                      min_sensors = 50, nmax_points = 3,
                                       idp_power = 2, 
                                       calculate_distances = FALSE,
                                       representative_timestamps = NULL) {
@@ -665,7 +745,7 @@ perform_idw_for_timepoint <- function(data, time_value, kelurahan_boundaries, gr
           median_distance = mean(median_distance, na.rm = TRUE),
           avg_distance = mean(avg_distance, na.rm = TRUE),
           max_distance = mean(max_distance, na.rm = TRUE),
-          n_points = n(),
+          n_grids = n(),  # Renamed from n_points to n_grids
           n_sensors_used = nrow(data_at_time),
           n_contributing_sensors = count_unique_sensors(contributing_sensors),
           # Properly convert POSIXct to Stata's %tc format (milliseconds since 01jan1960)
@@ -680,7 +760,7 @@ perform_idw_for_timepoint <- function(data, time_value, kelurahan_boundaries, gr
           avg_pm25 = mean(pm25_value, na.rm = TRUE),
           min_pm25 = min(pm25_value, na.rm = TRUE),
           max_pm25 = max(pm25_value, na.rm = TRUE),
-          n_points = n(),
+          n_grids = n(),  # Renamed from n_points to n_grids
           n_sensors_used = nrow(data_at_time),
           n_contributing_sensors = count_unique_sensors(contributing_sensors),
           # Properly convert POSIXct to Stata's %tc format (milliseconds since 01jan1960)
@@ -689,10 +769,7 @@ perform_idw_for_timepoint <- function(data, time_value, kelurahan_boundaries, gr
         )
     }
     
-    # Rename the kelurahan field to match expected output
-    kelurahan_summary <- kelurahan_summary %>%
-      rename(KELURAHAN_NAME = kelurahan_name)
-    
+    # No need to rename kelurahan_name as it's already correctly named
     return(kelurahan_summary)
   }, error = function(e) {
     cat("ERROR processing timestamp", format(time_value, "%Y-%m-%d %H:%M:%S"), ":", e$message, "\n")
@@ -701,57 +778,10 @@ perform_idw_for_timepoint <- function(data, time_value, kelurahan_boundaries, gr
 }
 
 #===============================================================================
-# IDENTIFY REPRESENTATIVE TIMESTAMPS FOR DISTANCE METRICS
+# PARALLEL PROCESSING SETUP
 #===============================================================================
-# Calculate sensor availability for each timestamp
-cat("\nIdentifying representative timestamps for distance calculations...\n")
-timestamp_availability <- sensors_processed %>%
-  group_by(rounded_datetime) %>%
-  summarize(
-    available_sensors = sum(!is.na(pm25)),
-    .groups = "drop"
-  ) %>%
-  arrange(rounded_datetime)
-
-# Find timestamps with max, min, and median sensor counts
-max_sensors_timestamp <- timestamp_availability %>%
-  arrange(desc(available_sensors)) %>%
-  slice(1) %>%
-  pull(rounded_datetime)
-
-min_sensors_timestamp <- timestamp_availability %>%
-  filter(available_sensors >= min_sensors_to_use) %>%  # Ensure we have enough sensors
-  arrange(available_sensors) %>%
-  slice(1) %>%
-  pull(rounded_datetime)
-
-# For median, get the middle value
-median_index <- ceiling(nrow(timestamp_availability) / 2)
-median_sensors_timestamp <- timestamp_availability %>%
-  arrange(available_sensors) %>%
-  slice(median_index) %>%
-  pull(rounded_datetime)
-
-# Store these timestamps in a list for easy checking
-representative_timestamps <- c(max_sensors_timestamp, min_sensors_timestamp, median_sensors_timestamp)
-
-cat("Selected representative timestamps for distance calculations:\n")
-cat("- Maximum sensors (", 
-    timestamp_availability$available_sensors[timestamp_availability$rounded_datetime == max_sensors_timestamp],
-    " sensors): ", format(max_sensors_timestamp, "%Y-%m-%d %H:%M:%S"), "\n", sep="")
-cat("- Minimum sensors (", 
-    timestamp_availability$available_sensors[timestamp_availability$rounded_datetime == min_sensors_timestamp],
-    " sensors): ", format(min_sensors_timestamp, "%Y-%m-%d %H:%M:%S"), "\n", sep="")
-cat("- Median sensors (", 
-    timestamp_availability$available_sensors[timestamp_availability$rounded_datetime == median_sensors_timestamp],
-    " sensors): ", format(median_sensors_timestamp, "%Y-%m-%d %H:%M:%S"), "\n", sep="")
-
-# Get list of all unique rounded timestamps
-unique_times <- unique(sensors_processed$rounded_datetime)
-cat("Total timestamps to process:", length(unique_times), "\n")
-
 # Set up parallel processing
-cat("Setting up parallel processing...\n")
+cat("\nSetting up parallel processing...\n")
 cores <- detectCores() - 1  # Leave one core free for system processes
 if(cores < 1) cores <- 1
 cat("Using", cores, "CPU cores for parallel processing\n")
@@ -761,14 +791,17 @@ registerDoParallel(cl)
 #===============================================================================
 # RUN PARALLEL INTERPOLATION
 #===============================================================================
-# Apply IDW for each timestamp in parallel and combine results
-cat("\nRunning parallel IDW interpolation...\n")
-results <- foreach(i = seq_along(unique_times),
+# Apply IDW for each qualifying timestamp in parallel and combine results
+cat("\nRunning parallel IDW interpolation with nmax =", nmax_points_to_use, "...\n")
+cat("Processing", length(qualifying_timestamps), "timestamps with at least", min_sensors_to_use, "sensors\n")
+
+results <- foreach(i = seq_along(qualifying_timestamps),
                    .packages = c("sf", "gstat", "dplyr", "geosphere"),
                    .export = c("perform_idw_for_timepoint", "min_sensors_to_use",
                                "nmax_points_to_use", "interpolation_grid",
-                               "kelurahan_name_field", "representative_timestamps")) %dopar% {
-                                 time_value <- unique_times[i]
+                               "kelurahan_name_field", "representative_timestamps", "kelurahan")) %dopar% {
+                                 
+                                 time_value <- qualifying_timestamps[i]
                                  
                                  # Determine if we should calculate distances for this timestamp
                                  calculate_distances <- time_value %in% representative_timestamps
@@ -782,7 +815,7 @@ results <- foreach(i = seq_along(unique_times),
                                    kelurahan_name_field = kelurahan_name_field,
                                    min_sensors = min_sensors_to_use,
                                    nmax_points = nmax_points_to_use,
-                                   idp_power = 2,
+                                   idp_power = idp_power,
                                    calculate_distances = calculate_distances,
                                    representative_timestamps = representative_timestamps
                                  )
@@ -802,32 +835,42 @@ cat("\nParallel processing complete\n")
 all_results <- results[!sapply(results, is.null)]
 final_kelurahan_data <- bind_rows(all_results)
 
-cat("\nIDW interpolation complete. Successfully processed", length(all_results), "out of", length(unique_times), "timestamps.\n")
-cat("Success rate:", round(100 * length(all_results) / length(unique_times), 1), "%\n")
+cat("\nIDW interpolation complete. Successfully processed", length(all_results), 
+    "out of", length(qualifying_timestamps), "timestamps.\n")
+cat("Success rate:", round(100 * length(all_results) / length(qualifying_timestamps), 1), "%\n")
 
 # Log timestamps that failed
-if(length(all_results) < length(unique_times)) {
-  failed_count <- length(unique_times) - length(all_results)
-  cat("Failed to process", failed_count, "timestamps, likely due to insufficient sensor data.\n")
+if(length(all_results) < length(qualifying_timestamps)) {
+  failed_count <- length(qualifying_timestamps) - length(all_results)
+  cat("Failed to process", failed_count, "timestamps, likely due to interpolation issues.\n")
 }
 
 #===============================================================================
 # SAVE RESULTS
 #===============================================================================
-# Define output filenames with date patterns
-dta_output_file <- file.path(dirs$output, paste0("jakarta_kelurahan_pm25", date_suffix, ".dta"))
+# Define output filenames with date patterns and nmax
+dta_output_file <- file.path(dirs$output, paste0("jakarta_kelurahan_pm25_nmax", nmax_points_to_use, date_suffix, ".dta"))
 
 # Also create a special file for distance metrics
-distance_output_file <- file.path(dirs$output, paste0("jakarta_kelurahan_distances", date_suffix, ".dta"))
+distance_output_file <- file.path(dirs$output, paste0("jakarta_kelurahan_distances_nmax", nmax_points_to_use, date_suffix, ".dta"))
 
 # Filter results to separate regular data from distance metrics
 distance_data <- final_kelurahan_data %>%
-  filter(!is.null(timestamp_type) & timestamp_type != "regular") %>%
-  select(KELURAHAN_NAME, timestamp_type, min_distance, median_distance, avg_distance, max_distance, 
-         n_sensors_used, n_contributing_sensors, timestamp)
+  filter(!is.na(timestamp_type) & timestamp_type != "regular") %>%
+  select(kelurahan_name, timestamp_type, 
+         # Include PM2.5 measurements
+         avg_pm25, min_pm25, max_pm25,
+         # Distance metrics
+         min_distance, median_distance, avg_distance, max_distance,
+         # Metadata
+         n_grids, n_sensors_used, n_contributing_sensors, timestamp)
 
 regular_data <- final_kelurahan_data %>%
-  select(-timestamp_type)  # Remove timestamp_type column from regular data
+  filter(is.na(timestamp_type) | timestamp_type == "regular") %>%
+  select(kelurahan_name, avg_pm25, min_pm25, max_pm25, n_grids, 
+         n_sensors_used, n_contributing_sensors, timestamp) %>%
+  # Sort data by kelurahan_name and timestamp
+  arrange(kelurahan_name, timestamp)
 
 temp_output_dir <- file.path(tempdir(), "jakarta_pm25")
 
@@ -837,11 +880,12 @@ if (!dir.exists(temp_output_dir)) {
 }
 
 # Define temp output files
-temp_dta_output_file <- file.path(temp_output_dir, paste0("jakarta_kelurahan_pm25", date_suffix, ".dta"))
-temp_distance_output_file <- file.path(temp_output_dir, paste0("jakarta_kelurahan_distances", date_suffix, ".dta"))
+temp_dta_output_file <- file.path(temp_output_dir, paste0("jakarta_kelurahan_pm25_nmax", nmax_points_to_use, date_suffix, ".dta"))
+temp_distance_output_file <- file.path(temp_output_dir, paste0("jakarta_kelurahan_distances_nmax", nmax_points_to_use, date_suffix, ".dta"))
 
 # Save results to Stata format only
 cat("\nSaving results to Stata format...\n")
+
 # First try to save regular PM2.5 data to the original output directory
 tryCatch({
   # Save to Stata format
@@ -879,29 +923,31 @@ tryCatch({
 # Create a summary report
 cat("\n=== Jakarta PM2.5 Interpolation Summary ===\n")
 cat("Analysis run completed at:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
-cat("Performance optimizations used:\n")
+cat("Key parameters used:\n")
+cat("- nmax =", nmax_points_to_use, "(optimized based on sensitivity analysis)\n")
+cat("- Minimum active sensors =", min_sensors_to_use, "per timestamp\n")
+cat("- IDW power parameter =", idp_power, "\n")
 cat("- Parallel processing with", cores, "CPU cores\n")
-cat("- Increased grid cell size (0.005 degrees instead of 0.001)\n")
-cat("- Reduced nmax points (10 nearest points)\n")
-cat("- More efficient spatial joins\n")
-cat("- Pre-computed interpolation grid\n")
-cat("- Excluded sensors with invalid coordinates instead of assigning default locations\n")
-cat("- Extended coordinate bounds to include Kepulauan Seribu (latitude range -7° to -5.4°)\n")
-cat("- Improved handling of mixed frequency sensors\n")
-cat("- Complete interpolation of all 30-minute timestamps\n")
+cat("- Grid cell size: 0.005 degrees\n")
+cat("- Half-hour imputation for sensors with hourly readings\n")
 
 if(nrow(final_kelurahan_data) > 0) {
   cat("\nResults summary:\n")
-  cat("Total timestamps processed:", length(all_results), "\n")
+  cat("Total timestamps processed:", length(all_results), "out of", length(qualifying_timestamps), 
+      "qualifying timestamps\n")
   
   # Use min and max of timestamp values (now in double format)
-  cat("Number of kelurahan:", n_distinct(final_kelurahan_data$KELURAHAN_NAME), "\n")
+  cat("Number of kelurahan:", n_distinct(final_kelurahan_data$kelurahan_name), "\n")
   cat("Overall average PM2.5:", round(mean(final_kelurahan_data$avg_pm25, na.rm = TRUE), 1), "μg/m³\n")
   
   # Print included fields
-  cat("\nFields included in output data:\n")
-  output_cols <- names(final_kelurahan_data)
+  cat("\nFields included in main output data:\n")
+  output_cols <- names(regular_data)
   cat(paste(output_cols, collapse = ", "), "\n")
+  
+  cat("\nFields included in distance output data:\n")
+  distance_cols <- names(distance_data)
+  cat(paste(distance_cols, collapse = ", "), "\n")
   
   # Report on n_contributing_sensors vs n_sensors_used and distance metrics
   cat("\nContributing sensors analysis:\n")
@@ -909,14 +955,16 @@ if(nrow(final_kelurahan_data) > 0) {
     summarize(
       avg_sensors_used = mean(n_sensors_used),
       avg_contributing_sensors = mean(n_contributing_sensors),
+      avg_grids = mean(n_grids),
       avg_contribution_ratio = mean(n_contributing_sensors / n_sensors_used)
     )
   cat("Average sensors used per timestamp:", round(sensor_stats$avg_sensors_used, 1), "\n")
   cat("Average contributing sensors per kelurahan:", round(sensor_stats$avg_contributing_sensors, 1), "\n")
+  cat("Average grid points per kelurahan:", round(sensor_stats$avg_grids, 1), "\n")
   cat("Average ratio of contributing to available sensors:", round(sensor_stats$avg_contribution_ratio*100, 1), "%\n")
   
   # Add distance metrics summary for representative timestamps
-  cat("\nDistance metrics (in kilometers) for representative timestamps:\n")
+  cat("\nDistance metrics and PM2.5 values for representative timestamps:\n")
   
   if(nrow(distance_data) > 0) {
     # Summarize by timestamp type
@@ -927,6 +975,10 @@ if(nrow(final_kelurahan_data) > 0) {
         avg_median_distance = mean(median_distance, na.rm = TRUE),
         avg_avg_distance = mean(avg_distance, na.rm = TRUE),
         avg_max_distance = mean(max_distance, na.rm = TRUE),
+        avg_pm25_value = mean(avg_pm25, na.rm = TRUE),
+        min_pm25_value = min(min_pm25, na.rm = TRUE),
+        max_pm25_value = max(max_pm25, na.rm = TRUE),
+        avg_n_grids = mean(n_grids, na.rm = TRUE),
         sensor_count = first(n_sensors_used)
       )
     
@@ -936,6 +988,10 @@ if(nrow(final_kelurahan_data) > 0) {
       sensors <- distance_summary$sensor_count[i]
       
       cat("-- ", toupper(ts_type), " (", sensors, " sensors) --\n", sep="")
+      cat("PM2.5 values: Avg =", round(distance_summary$avg_pm25_value[i], 2),
+          "Min =", round(distance_summary$min_pm25_value[i], 2),
+          "Max =", round(distance_summary$max_pm25_value[i], 2), "μg/m³\n")
+      cat("Average grid points per kelurahan:", round(distance_summary$avg_n_grids[i], 1), "\n")
       cat("Average minimum distance:", round(distance_summary$avg_min_distance[i], 3), "km\n")
       cat("Average median distance:", round(distance_summary$avg_median_distance[i], 3), "km\n")
       cat("Average mean distance:", round(distance_summary$avg_avg_distance[i], 3), "km\n")
@@ -947,7 +1003,8 @@ if(nrow(final_kelurahan_data) > 0) {
   
   # Find top 5 kelurahan with highest average PM2.5
   top_kelurahan <- final_kelurahan_data %>%
-    group_by(KELURAHAN_NAME) %>%
+    filter(is.na(timestamp_type) | timestamp_type == "regular") %>%
+    group_by(kelurahan_name) %>%
     summarize(avg_pm25 = mean(avg_pm25, na.rm = TRUE), .groups = "drop") %>%
     arrange(desc(avg_pm25)) %>%
     head(5)
@@ -957,8 +1014,14 @@ if(nrow(final_kelurahan_data) > 0) {
   
   cat("\nResults saved to:\n")
   cat(dta_output_file, "\n")
-  cat("Temporary backup file (if main save failed):\n")
+  if(nrow(distance_data) > 0) {
+    cat(distance_output_file, "\n")
+  }
+  cat("Temporary backup files (if main save failed):\n")
   cat(temp_dta_output_file, "\n")
+  if(nrow(distance_data) > 0) {
+    cat(temp_distance_output_file, "\n")
+  }
 } else {
   cat("No results were generated. Processing failed for all timestamps.\n")
   cat("Possible reasons:\n")
@@ -967,11 +1030,11 @@ if(nrow(final_kelurahan_data) > 0) {
   cat("- Problems with the input data format\n")
   cat("\nSuggested fixes:\n")
   cat("- Try different IDW parameters (nmax, idp_power)\n")
-  cat("- Check the input data for valid PM2.5 measurements\n") 
+  cat("- Check the input data for valid PM2.5 measurements\n")
   cat("- Verify coordinates are valid for all sensors\n")
 }
 
 # Stop logging and close the connection
-cat("\nLogging complete at", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+cat("\nInterpolation complete at", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
 cat("Log file saved to:", log_file, "\n")
 sink(NULL)  # Close the log file connection
