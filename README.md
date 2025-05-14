@@ -1,4 +1,4 @@
-# PM2.5 Data Collection and Interpolation for Jakarta's Kelurahan
+# PM2.5 Data Collection and Interpolation System for Jakarta
 
 ## Project Overview
 
@@ -147,17 +147,24 @@ In simple terms, this means:
 - This approach maintains spatial integrity by only using sensors with confirmed valid locations
 
 #### 3. Reporting Frequency Analysis
-- The system needs to determine how often each sensor reports data - some report every 30 minutes, others only once per hour
-- For each sensor, the analysis examines whether it consistently reports at half-hour marks (e.g., 10:30, 11:30)
-- Classification rules:
-  * **30-minute sensor**: If a sensor has data for more than 70% of half-hour timestamps (like 10:30, 11:30), it's classified as reporting every 30 minutes
-  * **Hourly sensor**: If a sensor has data for less than 30% of half-hour timestamps, it's classified as reporting only at full hours (like 10:00, 11:00)
-  * **Mixed sensor**: Sensors with half-hour data between 30-70% of the time are explicitly classified as having mixed or inconsistent reporting patterns
-- The system counts and logs how many sensors fall into each category
-- **Global time interval decision**: The system compares the total count of 30-minute sensors vs. hourly sensors. If more sensors report at 30-minute intervals, the entire analysis uses 30-minute intervals. Otherwise, it uses hourly intervals. This is a single decision applied to the whole dataset, not decided sensor-by-sensor.
-- **Updated handling of mixed sensors**: In the final version of the code, mixed sensors are fully included in the interpolation process:
-  * When 30-minute intervals are used: Both hourly and mixed sensors have their missing values interpolated
-  * When hourly intervals are used: All sensors (including mixed) are included, with their data aggregated to hourly values
+- The system analyzes each sensor's reporting pattern to determine its frequency characteristics
+- For each sensor, it examines the timestamps when the sensor should report at half-hour marks (XX:30)
+- Classification rules focus on how consistently a sensor reports at half-hour marks (XX:30):
+  * **30-minute sensor**: If more than 70% of possible half-hour marks (XX:30) have valid PM2.5 readings, the sensor is classified as a "30-minute sensor." These sensors reliably report at both hour (XX:00) and half-hour (XX:30) intervals.
+  * **Hourly sensor**: If less than 30% of possible half-hour marks (XX:30) have valid PM2.5 readings, the sensor is classified as an "hourly sensor." These sensors primarily report at hour marks (XX:00) only.
+  * **Mixed sensor**: If 30-70% of possible half-hour marks (XX:30) have valid PM2.5 readings, the sensor is classified as having a "mixed" reporting pattern.
+- Example: For a 24-hour period (with 24 possible half-hour timestamps):
+  * A sensor with ≥17 readings at XX:30 times is classified as a "30-minute sensor"
+  * A sensor with ≤7 readings at XX:30 times is classified as an "hourly sensor"
+  * A sensor with 8-16 readings at XX:30 times is classified as a "mixed sensor"
+- The system counts how many sensors fall into each category
+- **Global time interval decision**: Based on which type is most common (30-minute vs. hourly sensors), the system decides whether to use 30-minute or hourly intervals for the entire analysis. This is a single decision applied to the whole dataset, not decided sensor-by-sensor.
+- Different handling based on sensor type and interval decision:
+  * When 30-minute intervals are used:
+    * 30-minute sensors: Data is used as-is without interpolation (any occasional missing values remain missing)
+    * Hourly and mixed sensors: Their missing half-hour values are selectively interpolated
+  * When hourly intervals are used:
+    * All sensors (30-minute, hourly, and mixed): Data is aggregated to hourly values
 
 #### 4. Timestamp Standardization
 - Round all timestamps to either 30-minute or hourly intervals based on the decision in step 3
